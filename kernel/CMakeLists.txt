@@ -1,5 +1,6 @@
 add_library(cornishrtk_kernel STATIC
   hooks_stub.cpp
+  scheduler.cpp
 )
 
 target_link_libraries(cornishrtk_kernel PUBLIC cornishrtk_port_impl)
