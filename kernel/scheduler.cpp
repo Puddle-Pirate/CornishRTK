@@ -1,17 +1,22 @@
 /**
  *
  */
+#include <bitset>
 #include <cassert>
 #include <cornishrtk.hpp>
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <array>
+#include <bit>
+#include <time.h>
 
 namespace rtk
 {
+   static void DEBUG_DUMP_READY_QUEUE(const char* where);
 
    struct TaskControlBlock
    {
@@ -34,18 +39,16 @@ namespace rtk
 
    struct InternalSchedulerState
    {
-      std::atomic<uint32_t> tick{0};
       std::atomic<bool> preempt_disabled{false};
       std::atomic<bool> need_reschedule{false};
       TaskControlBlock* current_task{nullptr};
 
       std::array<std::deque<TaskControlBlock*>, MAX_PRIORITIES> ready{}; // TODO: replace deque
-      uint32_t ready_bitmap{0};
+      std::bitset<MAX_PRIORITIES> ready_bitmap;
       std::deque<TaskControlBlock*> sleep_queue{}; // TODO: replace with wheel/heap later
 
       void reset()
       {
-         tick.store(0);
          preempt_disabled.store(false);
          need_reschedule.store(false);
          current_task = nullptr;
@@ -55,8 +58,8 @@ namespace rtk
 
    static TaskControlBlock* pick_highest_ready()
    {
-      if (!iss.ready_bitmap) return nullptr;
-      uint8_t priority = std::countr_zero(iss.ready_bitmap);
+      if (iss.ready_bitmap.none()) return nullptr;
+      uint8_t priority = std::countr_zero(iss.ready_bitmap.to_ulong());
       return iss.ready[priority].front();
    }
 
@@ -64,14 +67,14 @@ namespace rtk
    {
       auto& queue = iss.ready[priority];
       queue.pop_front();
-      if (queue.empty()) iss.ready_bitmap &= ~(1u << priority);
+      if (queue.empty()) iss.ready_bitmap.reset(priority);
    }
 
    static void set_ready(TaskControlBlock* tcb)
    {
       tcb->state = TaskControlBlock::State::Ready;
       iss.ready[tcb->priority].push_back(tcb);
-      iss.ready_bitmap |= (1u << tcb->priority);
+      iss.ready_bitmap.set(tcb->priority);
    }
 
    static void context_switch_to(TaskControlBlock* next)
@@ -88,8 +91,31 @@ namespace rtk
    {
       if (iss.preempt_disabled.load()) return;
       if (!iss.need_reschedule.exchange(false)) return;
+      DEBUG_DUMP_READY_QUEUE("schedule() need_reschedule -> true");
+
+      uint32_t const now = Scheduler::tick_now();
+      for (auto it = iss.sleep_queue.begin(); it != iss.sleep_queue.end();) {
+         TaskControlBlock* tcb = *it;
+         if (static_cast<int32_t>(now - tcb->wake_tick) >= 0) {
+            iss.need_reschedule.store(true, std::memory_order_relaxed);
+            it = iss.sleep_queue.erase(it);
+            set_ready(tcb);
+         } else {
+            ++it;
+         }
+      }
+
+      // Round-robin: if current’s slice expired, move it to tail first
+      if (iss.current_task &&
+         iss.current_task->state == TaskControlBlock::State::Running &&
+         iss.current_task->timeslice_left == 0)
+      {
+         set_ready(iss.current_task);
+         iss.current_task->state = TaskControlBlock::State::Ready;
+      }
 
       auto next = pick_highest_ready();
+      if (!next) return; // Nothing ready yet!
       remove_ready_head(next->priority);
       context_switch_to(next);
    }
@@ -102,9 +128,11 @@ namespace rtk
 
    void Scheduler::start()
    {
+      DEBUG_DUMP_READY_QUEUE("start() entry");
       auto first = pick_highest_ready();
       assert(first != nullptr);
       remove_ready_head(first->priority);
+      DEBUG_DUMP_READY_QUEUE("start() head picked/removed");
       iss.current_task = first;
       iss.current_task->state = TaskControlBlock::State::Running;
       iss.current_task->timeslice_left = TIME_SLICE;
@@ -123,8 +151,11 @@ namespace rtk
 
    void Scheduler::yield()
    {
+      if (iss.current_task && iss.current_task->state == TaskControlBlock::State::Running) {
+         set_ready(iss.current_task); // put current at tail
+         iss.current_task->state = TaskControlBlock::State::Ready;
+      }
       rtk_request_reschedule();
-      // In sim, returning to the scheduler loop requires the port thread to .resume()
       port_yield();
    }
 
@@ -184,6 +215,7 @@ namespace rtk
       port_context_init(tcb->context, stack_base, stack_size, thread_trampoline, tcb);
 
       set_ready(tcb);
+      DEBUG_DUMP_READY_QUEUE("Thread() created");
    }
 
    Thread::~Thread() {
@@ -195,45 +227,30 @@ namespace rtk
 
    extern "C" void rtk_on_tick(void)
    {
-      // Monotonic tick
-      iss.tick.fetch_add(1, std::memory_order_relaxed);
-
       // Wake sleepers whose time expired
       // (linear walk now, replace with timer wheel later)
       uint32_t const now = Scheduler::tick_now();
-      for (auto it = iss.sleep_queue.begin(); it != iss.sleep_queue.end();) {
-         TaskControlBlock* tcb = *it;
+      for (auto tcb : iss.sleep_queue) {
          if (static_cast<int32_t>(now - tcb->wake_tick) >= 0) {
-            it = iss.sleep_queue.erase(it);
-            set_ready(tcb);
-         } else {
-            ++it;
+            iss.need_reschedule.store(true, std::memory_order_relaxed);
+            break;
          }
       }
 
       // Round-robin slice accounting for current thread (if any)
       if (iss.current_task && iss.current_task->state == TaskControlBlock::State::Running) {
-         if (iss.current_task->timeslice_left > 0) {
-               --iss.current_task->timeslice_left;
-         }
+         if (iss.current_task->timeslice_left > 0) --iss.current_task->timeslice_left;
          if (iss.current_task->timeslice_left == 0) {
-            // Move to tail of its ready queue if peers exist
-            auto& queue = iss.ready[iss.current_task->priority];
-            if (!queue.empty()) {
-               queue.push_back(iss.current_task);
-               // Remove whichever is at head. we’ll re-pick in reschedule path
-               // (Do not remove current from head here. current may not be in q.)
-               iss.need_reschedule.store(1, std::memory_order_relaxed);
-               iss.current_task->timeslice_left = TIME_SLICE;
-            }
+            iss.need_reschedule.store(true, std::memory_order_relaxed);
+            iss.current_task->timeslice_left = TIME_SLICE; // reset for next run
          }
       }
 
       // If any higher-prio thread is ready, request reschedule
-      if (iss.ready_bitmap) {
-         uint8_t best = std::countr_zero(iss.ready_bitmap);
+      if (iss.ready_bitmap.any()) {
+         uint8_t best = std::countr_zero(iss.ready_bitmap.to_ulong());
          if (!iss.current_task || best < iss.current_task->priority) {
-               iss.need_reschedule.store(1, std::memory_order_relaxed);
+            iss.need_reschedule.store(1, std::memory_order_relaxed);
          }
       }
    }
@@ -245,5 +262,16 @@ namespace rtk
       // On bare metal, we should pend a software interrupt and return from this ISR
    }
 
+
+static void DEBUG_DUMP_READY_QUEUE(const char* where)
+{
+#if defined(RTK_SIMULATION)
+   std::printf("[READY %s] bitmap: %s", where, iss.ready_bitmap.to_string().c_str());
+   for (unsigned p = 0; p < MAX_PRIORITIES; ++p) {
+      if (!iss.ready[p].empty()) std::printf(" p%u(%zu)", p, iss.ready[p].size());
+   }
+   std::printf(" current_task=%p\n", (void*)iss.current_task);
+#endif
+}
 
 } // namespace rtk

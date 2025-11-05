@@ -11,9 +11,9 @@ static void worker(void* arg)
 {
    while (true)
    {
-      std::cout << static_cast<char const*>(arg);
+      std::cout << static_cast<char const*>(arg) << "\n";
       // Sleep ~250 ms at 100 hz tick
-      rtk::Scheduler::sleep_for(25);
+      rtk::Scheduler::sleep_for(25000);
    }
 }
 
