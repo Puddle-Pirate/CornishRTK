@@ -27,7 +27,6 @@ namespace rtk
          Blocked,
       } state{State::Ready};
       uint8_t priority{0};
-      uint32_t timeslice_left{0};
       uint32_t wake_tick{0};
 
       port_context_t* context{nullptr};
@@ -43,11 +42,11 @@ namespace rtk
       std::atomic<bool> need_reschedule{false};
       TaskControlBlock* current_task{nullptr};
 
-      std::array<std::deque<TaskControlBlock*>, MAX_PRIORITIES> ready{}; // TODO: replace deque
+      std::array<std::deque<TaskControlBlock*>, MAX_PRIORITIES> ready{}; // TODO: replace deque with something that does not use heap
       std::bitset<MAX_PRIORITIES> ready_bitmap;
       std::deque<TaskControlBlock*> sleep_queue{}; // TODO: replace with wheel/heap later
-      std::atomic<uint32_t> next_wake_tick{UINT32_MAX};
-      std::atomic<bool> slice_tick_pending{false};
+      std::atomic<uint32_t> next_wake_tick{UINT32_MAX}; // When next sleeper must be woken
+      std::atomic<uint32_t> next_slice_tick{UINT32_MAX}; // When the next RR rotation is due
 
       void reset() // Should I just do a self assignment from default ctor instead?
       {
@@ -55,7 +54,7 @@ namespace rtk
          need_reschedule.store(false);
          current_task = nullptr;
          next_wake_tick.store(UINT32_MAX);
-         slice_tick_pending.store(false);
+         next_slice_tick.store(UINT32_MAX);
       }
    };
    static /*constinit*/ InternalSchedulerState iss;
@@ -115,23 +114,20 @@ namespace rtk
       iss.next_wake_tick.store(next_due, std::memory_order_relaxed);
 
       // Round robin rotation
-      if (iss.slice_tick_pending.exchange(false, std::memory_order_acq_rel) &&
+      if (static_cast<int32_t>(now - iss.next_slice_tick.load(std::memory_order_relaxed)) >= 0 &&
          iss.current_task &&
+         !iss.ready[iss.current_task->priority].empty() && // Don't requeue for singular threads at a priority level
          iss.current_task->state == TaskControlBlock::State::Running)
       {
-         if (iss.current_task->timeslice_left) --iss.current_task->timeslice_left;
-         if (iss.current_task->timeslice_left == 0) {
-            set_ready(iss.current_task);
-            iss.current_task->state = TaskControlBlock::State::Ready;
-            iss.current_task->timeslice_left = TIME_SLICE;
-         }
+         set_ready(iss.current_task);
+         iss.current_task->state = TaskControlBlock::State::Ready;
       }
+      // Serve a fresh slice
+      iss.next_slice_tick.store(now + TIME_SLICE, std::memory_order_relaxed);
 
       auto* next_task = pick_highest_ready();
       if (!next_task) return; // Shhhh everyone is sleeping!
       remove_ready_head(next_task->priority);
-      // Serve a fresh slice
-      if (next_task->timeslice_left == 0) next_task->timeslice_left = TIME_SLICE;
       context_switch_to(next_task);
    }
 
@@ -150,7 +146,6 @@ namespace rtk
       DEBUG_DUMP_READY_QUEUE("start() head picked/removed");
       iss.current_task = first;
       iss.current_task->state = TaskControlBlock::State::Running;
-      iss.current_task->timeslice_left = TIME_SLICE;
 
       port_start_first(iss.current_task->context);
 
@@ -248,13 +243,12 @@ namespace rtk
 
    extern "C" void rtk_on_tick(void)
    {
+      auto const now = Scheduler::tick_now();
       // Request reschedule if a wakeup is due
-      if (static_cast<int32_t>(Scheduler::tick_now() - iss.next_wake_tick.load(std::memory_order_relaxed)) >= 0) {
+      if (static_cast<int32_t>(now - iss.next_wake_tick.load(std::memory_order_relaxed))  >= 0 ||
+          static_cast<int32_t>(now - iss.next_slice_tick.load(std::memory_order_relaxed)) >= 0 ) {
          iss.need_reschedule.store(true, std::memory_order_relaxed);
       }
-
-      // Flag that slice might have expired
-      iss.slice_tick_pending.store(true, std::memory_order_relaxed);
    }
 
    extern "C" void rtk_request_reschedule(void)
@@ -265,15 +259,15 @@ namespace rtk
    }
 
 
-static void DEBUG_DUMP_READY_QUEUE(const char* where)
-{
-#if defined(RTK_SIMULATION)
-   std::printf("[READY %s] bitmap: %s", where, iss.ready_bitmap.to_string().c_str());
-   for (unsigned p = 0; p < MAX_PRIORITIES; ++p) {
-      if (!iss.ready[p].empty()) std::printf(" p%u(%zu)", p, iss.ready[p].size());
+   static void DEBUG_DUMP_READY_QUEUE(const char* where)
+   {
+   #if defined(RTK_SIMULATION)
+      std::printf("[%d %s] bitmap: %s", port_tick_now(), where, iss.ready_bitmap.to_string().c_str());
+      for (unsigned p = 0; p < MAX_PRIORITIES; ++p) {
+         if (!iss.ready[p].empty()) std::printf(" p%u(%zu)", p, iss.ready[p].size());
+      }
+      std::printf(" current_task=%p\n", (void*)iss.current_task);
+   #endif
    }
-   std::printf(" current_task=%p\n", (void*)iss.current_task);
-#endif
-}
 
 } // namespace rtk

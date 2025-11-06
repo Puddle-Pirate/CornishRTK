@@ -106,6 +106,13 @@ void port_yield()
    }
 }
 
+void port_idle()
+{
+   // Sleep 1 ms
+   struct timespec req{.tv_nsec = 1'000'000};
+   nanosleep(&req, nullptr);
+}
+
 // Tick source: SIGALRM -> bump tick & call kernel hook. No switching here.
 static void tick_handler(int)
 {
