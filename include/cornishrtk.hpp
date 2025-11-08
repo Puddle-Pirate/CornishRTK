@@ -9,21 +9,23 @@
 #define _CORNISH_RTK_HPP_
 
 #include <cstdint>
+#include <cstddef>
 #include <port.h>
 
 namespace rtk
 {
    //-------------- Config ---------------
-   static constexpr uint32_t MAX_PRIORITIES = 32; // 0 = highest, 32 = lowest
+   static constexpr uint32_t MAX_PRIORITIES = 32; // 0 = highest, 31 = lowest
    static constexpr uint32_t TIME_SLICE     = 10; // In ticks
 
+   static_assert(MAX_PRIORITIES <= sizeof(unsigned long)*8, "std::bit_set<>::to_ulong() truncates");
 
    struct Scheduler
    {
       static void init(uint32_t tick_hz);
       static void start();
       static void yield();
-      static uint32_t tick_now();
+      static class Tick tick_now();
       static void sleep_for(uint32_t ticks);  // cooperative sleep (sim)
 
       static void preempt_disable();
@@ -46,11 +48,92 @@ namespace rtk
       ~Thread();
    };
 
+
    class Mutex;
 
    class Semaphore;
 
    class ConditionVar;
+
+
+   // TODO: The footprint of this class has grown quite big. Is it cleaner to keep in in a separate header? My assumption is 'probably not'
+   class Tick
+   {
+      uint32_t t{0};
+
+      static constexpr bool after_eq_u32(uint32_t a, uint32_t b) noexcept
+      {
+         constexpr uint32_t HALF = 1u << 31;
+         return uint32_t(a - b) < HALF; // a >= b (wrap-safe)
+      }
+
+   public:
+      using Delta = uint32_t;
+
+      constexpr Tick() noexcept = default;
+      constexpr explicit Tick(uint32_t value) noexcept : t(value) {}
+
+      [[nodiscard]] constexpr uint32_t value() const noexcept { return t; }
+
+      // Wrap-safe "now >= deadline"
+      [[nodiscard]] constexpr bool has_reached(uint32_t deadline) const noexcept
+      {
+         return after_eq_u32(t, deadline);
+      }
+      [[nodiscard]] constexpr bool has_reached(Tick deadline) const noexcept
+      {
+         return after_eq_u32(t, deadline.t);
+      }
+      // Wrap-safe "now < deadline"
+      [[nodiscard]] constexpr bool is_before(uint32_t deadline) const noexcept
+      {
+         return !after_eq_u32(t, deadline);
+      }
+      [[nodiscard]] constexpr bool is_before(Tick deadline) const noexcept
+      {
+         return !after_eq_u32(t, deadline.t);
+      }
+
+      // ---- Arithmetic ----
+      // Future deadline: wraps naturally
+      friend constexpr Tick operator+(Tick tick, Delta delta) noexcept
+      {
+         return Tick(uint32_t(tick.t + delta));
+      }
+      friend constexpr Tick operator+(Delta delta, Tick tick) noexcept
+      {
+         return tick + delta;
+      }
+      Tick& operator+=(Delta delta) noexcept
+      {
+         t += delta; return *this;
+      }
+
+      // Elapsed ticks between two instants (mod 2^32)
+      friend constexpr Delta operator-(Tick lhs, Tick rhs) noexcept
+      {
+         return uint32_t(lhs.t - rhs.t);
+      }
+
+      // ---- Comparators vs uint32_t/Tick deadlines (wrap-safe '>=' and '<') ----
+      friend constexpr bool operator>=(Tick now, uint32_t deadline) noexcept
+      {
+         return now.has_reached(deadline);
+      }
+      friend constexpr bool operator<(Tick now, uint32_t deadline) noexcept
+      {
+         return now.is_before(deadline);
+      }
+      friend constexpr bool operator>=(Tick now, Tick deadline) noexcept
+      {
+         return now.has_reached(deadline.t);
+      }
+      friend constexpr bool operator<(Tick now, Tick deadline) noexcept
+      {
+         return now.is_before(deadline.t);
+      }
+   };
+   static_assert(sizeof(Tick) == sizeof(uint32_t), "It is important that Tick be as cheap as uint32_t");
 
 
 

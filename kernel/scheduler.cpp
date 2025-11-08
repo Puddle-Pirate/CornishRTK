@@ -19,6 +19,9 @@ namespace rtk
 {
    static void DEBUG_DUMP_READY_QUEUE(const char* where);
 
+   // Could try make a std::atomic<tick> work? Will have to investigate
+   using AtomicTick = std::atomic<uint32_t>;
+
    struct TaskControlBlock
    {
       enum class State : uint8_t {
@@ -28,7 +31,7 @@ namespace rtk
          Blocked,
       } state{State::Ready};
       uint8_t priority{0};
-      uint32_t wake_tick{0};
+      Tick wake_tick{0};
 
       port_context_t* context{nullptr};
       void*  stack_base{nullptr};
@@ -45,10 +48,9 @@ namespace rtk
 
       std::array<std::deque<TaskControlBlock*>, MAX_PRIORITIES> ready{}; // TODO: replace deque with something that does not use heap
       std::bitset<MAX_PRIORITIES> ready_bitmap;
-      static_assert(MAX_PRIORITIES <= sizeof(unsigned long)*8, "to_ulong truncates");
       std::deque<TaskControlBlock*> sleep_queue{}; // TODO: replace with wheel/heap later
-      std::atomic<uint32_t> next_wake_tick{UINT32_MAX}; // When next sleeper must be woken
-      std::atomic<uint32_t> next_slice_tick{UINT32_MAX}; // When the next RR rotation is due
+      AtomicTick next_wake_tick{UINT32_MAX}; // When next sleeper must be woken
+      AtomicTick next_slice_tick{UINT32_MAX}; // When the next RR rotation is due
 
       void reset() // Should I just do a self assignment from default ctor instead?
       {
@@ -102,31 +104,29 @@ namespace rtk
       if (!iss.need_reschedule.exchange(false)) return;
       DEBUG_DUMP_READY_QUEUE("schedule() need_reschedule -> true");
 
-      uint32_t const now = Scheduler::tick_now();
+      auto const now = Scheduler::tick_now();
 
       uint32_t next_due = UINT32_MAX;
       for (auto it = iss.sleep_queue.begin(); it != iss.sleep_queue.end(); ) {
          TaskControlBlock* tcb = *it;
-         if (static_cast<int32_t>(now - tcb->wake_tick) >= 0) {
+         if (now.has_reached(tcb->wake_tick)) {
             it = iss.sleep_queue.erase(it);
             set_ready(tcb);
          } else {
-            next_due = std::min(next_due, tcb->wake_tick);
+            next_due = std::min(next_due, tcb->wake_tick.value());
             ++it;
          }
       }
       iss.next_wake_tick.store(next_due, std::memory_order_relaxed);
 
       // Round robin rotation
-      if (static_cast<int32_t>(now - iss.next_slice_tick.load(std::memory_order_relaxed)) >= 0 &&
+      if (now.has_reached(iss.next_slice_tick.load(std::memory_order_relaxed)) &&
          iss.current_task &&
          !iss.ready[iss.current_task->priority].empty() && // Don't requeue for singular threads at a priority level
          iss.current_task->state == TaskControlBlock::State::Running)
       {
          set_ready(iss.current_task);
       }
-      // Serve a fresh slice
-      iss.next_slice_tick.store(now + TIME_SLICE, std::memory_order_relaxed);
 
       auto* next_task = pick_highest_ready();
       if (!next_task) {
@@ -142,6 +142,8 @@ namespace rtk
       }
 
       remove_ready_head(next_task->priority);
+      // Serve a fresh slice
+      iss.next_slice_tick.store(now.value() + TIME_SLICE, std::memory_order_relaxed);
       context_switch_to(next_task);
    }
 
@@ -160,7 +162,7 @@ namespace rtk
       DEBUG_DUMP_READY_QUEUE("start() head picked/removed");
       iss.current_task = first;
       iss.current_task->state = TaskControlBlock::State::Running;
-      iss.next_slice_tick.store(Scheduler::tick_now() + TIME_SLICE, std::memory_order_relaxed);
+      iss.next_slice_tick.store(Scheduler::tick_now().value() + TIME_SLICE, std::memory_order_relaxed);
 
       port_start_first(iss.current_task->context);
 
@@ -183,9 +185,9 @@ namespace rtk
       port_yield();
    }
 
-   uint32_t Scheduler::tick_now()
+   Tick Scheduler::tick_now()
    {
-      return port_tick_now();
+      return Tick(port_tick_now());
    }
 
    void Scheduler::sleep_for(uint32_t ticks)
@@ -194,20 +196,20 @@ namespace rtk
       // Put current to sleep
       assert(iss.current_task && "no current thread");
       iss.current_task->state = TaskControlBlock::State::Sleeping;
-      iss.current_task->wake_tick = tick_now() + ticks;
+      iss.current_task->wake_tick = tick_now() + (ticks);
       iss.sleep_queue.push_back(iss.current_task);
 
-      auto cur = iss.next_wake_tick.load(std::memory_order_relaxed);
-      if (static_cast<int32_t>(iss.current_task->wake_tick - cur) < 0) {
-         iss.next_wake_tick.store(iss.current_task->wake_tick, std::memory_order_relaxed);
+      if (iss.current_task->wake_tick.is_before(iss.next_wake_tick.load(std::memory_order_relaxed)))
+      {
+         iss.next_wake_tick.store(iss.current_task->wake_tick.value(), std::memory_order_relaxed);
       }
 
       rtk_request_reschedule();
       port_yield();
    }
 
-   void Scheduler::preempt_disable() { port_preempt_disable(); iss.preempt_disabled.store(true); }
-   void Scheduler::preempt_enable()  { iss.preempt_disabled.store(false); port_preempt_enable(); }
+   void Scheduler::preempt_disable() { port_preempt_disable(); iss.preempt_disabled.store(true, std::memory_order_release); }
+   void Scheduler::preempt_enable()  { iss.preempt_disabled.store(false, std::memory_order_release); port_preempt_enable(); }
 
    static port_context_t* alloc_port_context()
    {
@@ -259,15 +261,16 @@ namespace rtk
    {
       auto const now = Scheduler::tick_now();
       // Request reschedule if a wakeup is due
-      if (static_cast<int32_t>(now - iss.next_wake_tick.load(std::memory_order_relaxed))  >= 0 ||
-          static_cast<int32_t>(now - iss.next_slice_tick.load(std::memory_order_relaxed)) >= 0 ) {
-         iss.need_reschedule.store(true, std::memory_order_relaxed);
+      if (now.has_reached(iss.next_wake_tick.load(std::memory_order_relaxed)) ||
+          now.has_reached(iss.next_slice_tick.load(std::memory_order_relaxed)))
+      {
+         rtk_request_reschedule();
       }
    }
 
    extern "C" void rtk_request_reschedule(void)
    {
-      iss.need_reschedule.store(1, std::memory_order_relaxed);
+      iss.need_reschedule.store(true, std::memory_order_relaxed);
       // Under simulation we should return to the scheduler loop in user context
       // On bare metal, we should pend a software interrupt and return from this ISR
    }
