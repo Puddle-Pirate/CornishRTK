@@ -22,7 +22,6 @@ namespace rtk
    static void DEBUG_DUMP_READY_QUEUE(const char* where);
 
    static constexpr uint32_t UINT32_BITS = std::numeric_limits<uint32_t>::digits;
-
    static constexpr uint32_t IDLE_PRIORITY = MAX_PRIORITIES - 1;
 
    struct TaskControlBlock
@@ -45,6 +44,8 @@ namespace rtk
       // Intrusive queue links
       TaskControlBlock* next{nullptr};
       TaskControlBlock* prev{nullptr};
+
+      uint16_t sleep_index{UINT16_MAX};
    };
 
    class ReadyMatrix
@@ -145,6 +146,95 @@ namespace rtk
       }
    };
 
+   class SleepMinHeap
+   {
+      std::array<TaskControlBlock*, 64> heap_buffer{}; // TODO: Size this array
+      uint16_t size_count{0};
+
+      static uint16_t parent(uint16_t i) noexcept { return (i - 1u) >> 1; }
+      static uint16_t left  (uint16_t i) noexcept { return (i << 1) + 1u; }
+      static uint16_t right (uint16_t i) noexcept { return (i << 1) + 2u; }
+
+      static bool earlier(const TaskControlBlock* a, const TaskControlBlock* b) noexcept
+      {
+         return a->wake_tick.is_before(b->wake_tick);
+      }
+      void swap_nodes(uint16_t a, uint16_t b) noexcept
+      {
+         std::swap(heap_buffer[a], heap_buffer[b]);
+         heap_buffer[a]->sleep_index = a;
+         heap_buffer[b]->sleep_index = b;
+      }
+      void sift_up(uint16_t i) noexcept
+      {
+         while (i > 0) {
+            uint16_t p = parent(i);
+            if (!earlier(heap_buffer[i], heap_buffer[p])) break;
+            swap_nodes(i, p);
+            i = p;
+         }
+      }
+      void sift_down(uint16_t i) noexcept
+      {
+         uint16_t l, r, m;
+         while (true) {
+            uint16_t l = left(i), r = right(i), m = i;
+            if (l < size_count && earlier(heap_buffer[l], heap_buffer[m])) m = l;
+            if (r < size_count && earlier(heap_buffer[r], heap_buffer[m])) m = r;
+            if (m == i) break;
+            swap_nodes(i, m);
+            i = m;
+         }
+      }
+
+   public:
+      [[nodiscard]] bool empty() const noexcept { return size_count == 0; }
+      [[nodiscard]] uint16_t size() const noexcept { return size_count; }
+      [[nodiscard]] TaskControlBlock* top() const noexcept
+      {
+         return size_count ? heap_buffer[0] : nullptr;
+      }
+
+      void push(TaskControlBlock* tcb) noexcept
+      {
+         uint16_t i = size_count++;
+         heap_buffer[i] = tcb;
+         tcb->sleep_index = i;
+         sift_up(i);
+      }
+      TaskControlBlock* pop_min() noexcept
+      {
+         if (!size_count) return nullptr;
+         TaskControlBlock* tcb = heap_buffer[0];
+         tcb->sleep_index = 0xFFFF;
+         --size_count;
+         if (size_count) {
+            heap_buffer[0] = heap_buffer[size_count];
+            heap_buffer[0]->sleep_index = 0;
+            sift_down(0);
+         }
+         return tcb;
+      }
+      void remove(TaskControlBlock* tcb) noexcept
+      {
+         uint16_t i = tcb->sleep_index;
+         if (i == 0xFFFF) return; // not in heap
+         tcb->sleep_index = 0xFFFF;
+         --size_count;
+         if (i == size_count) return; // removed last
+
+         heap_buffer[i] = heap_buffer[size_count];
+         heap_buffer[i]->sleep_index = i;
+
+         // Re-heapify from i (either direction)
+         if (i > 0 && earlier(heap_buffer[i], heap_buffer[parent(i)])) {
+            sift_up(i);
+         } else {
+            sift_down(i);
+         }
+      }
+   };
+
    class AtomicDeadline
    {
       std::atomic_uint32_t deadline{UINT32_MAX};
@@ -169,7 +259,7 @@ namespace rtk
       Thread* idle_thread{nullptr};
 
       ReadyMatrix ready_matrix;
-      std::deque<TaskControlBlock*> sleep_queue{}; // TODO: replace with wheel/heap later
+      SleepMinHeap sleepers;
       AtomicDeadline next_wake_tick; // When next sleeper must be woken
       AtomicDeadline next_slice_tick; // When the next RR rotation is due
 
@@ -183,7 +273,7 @@ namespace rtk
          next_slice_tick.disarm();
       }
    };
-   static /*constinit*/ InternalSchedulerState iss;
+   static constinit InternalSchedulerState iss;
 
    static void set_task_ready(TaskControlBlock* tcb)
    {
@@ -214,18 +304,19 @@ namespace rtk
       auto const now = Scheduler::tick_now();
 
       // Wake sleepers
-      Tick next_due(UINT32_MAX);
-      for (auto it = iss.sleep_queue.begin(); it != iss.sleep_queue.end(); ) {
-         TaskControlBlock* tcb = *it;
-         if (now.has_reached(tcb->wake_tick)) {
-            it = iss.sleep_queue.erase(it);
-            set_task_ready(tcb);
-         } else {
-            next_due = std::min(next_due, tcb->wake_tick);
-            ++it;
-         }
+      while (true) {
+         auto* top_tcb = iss.sleepers.top();
+         if (!top_tcb || now.is_before(top_tcb->wake_tick)) break; // Not due yet
+         (void)iss.sleepers.pop_min();
+         set_task_ready(top_tcb);
       }
-      iss.next_wake_tick.store(next_due);
+
+      // Update when the next sleeper will wake up
+      if (auto* top_tcb = iss.sleepers.top()) {
+         iss.next_wake_tick.store(top_tcb->wake_tick);
+      } else {
+         iss.next_wake_tick.disarm();
+      }
 
       // Round robin rotation
       if (now.has_reached(iss.next_slice_tick.load()) &&
@@ -313,11 +404,10 @@ namespace rtk
       assert(iss.current_task && "no current thread");
       iss.current_task->state = TaskControlBlock::State::Sleeping;
       iss.current_task->wake_tick = tick_now() + (ticks);
-      iss.sleep_queue.push_back(iss.current_task);
+      iss.sleepers.push(iss.current_task);
 
-      if (iss.current_task->wake_tick.is_before(iss.next_wake_tick.load()))
-      {
-         iss.next_wake_tick.store(iss.current_task->wake_tick);
+      if (auto const* top_tcb = iss.sleepers.top()) {
+         iss.next_wake_tick.store(top_tcb->wake_tick);
       }
 
       rtk_request_reschedule();
