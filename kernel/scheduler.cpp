@@ -13,9 +13,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <deque>
 #include <time.h>
-#include <numeric>
+#include <limits>
 
 namespace rtk
 {
@@ -435,7 +434,7 @@ namespace rtk
       auto tcb = static_cast<TaskControlBlock*>(arg_void);
       tcb->entry_fn(tcb->arg);
       // If user function returns, park/surrender forever (could signal joiners later)
-      for (;;) { Scheduler::yield(); }
+      while (true) Scheduler::yield();
    }
 
    Thread::Thread(EntryFunction fn, void* arg, void* stack_base, std::size_t stack_size, uint8_t priority)
