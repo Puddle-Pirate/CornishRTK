@@ -15,10 +15,13 @@
 #include <cstdlib>
 #include <deque>
 #include <time.h>
+#include <numeric>
 
 namespace rtk
 {
    static void DEBUG_DUMP_READY_QUEUE(const char* where);
+
+   static constexpr uint32_t UINT32_BITS = std::numeric_limits<uint32_t>::digits;
 
    static constexpr uint32_t IDLE_PRIORITY = MAX_PRIORITIES - 1;
 
@@ -38,21 +41,124 @@ namespace rtk
       size_t stack_size{0};
       Thread::EntryFunction entry_fn;
       void*  arg{nullptr};
+
+      // Intrusive queue links
+      TaskControlBlock* next{nullptr};
+      TaskControlBlock* prev{nullptr};
    };
 
-   struct AtomicDeadline
+   class ReadyMatrix
+   {
+      class RoundRobinQueue
+      {
+         TaskControlBlock* head{nullptr};
+         TaskControlBlock* tail{nullptr};
+
+      public:
+         [[nodiscard]] constexpr bool empty() const noexcept { return !head; }
+         [[nodiscard]] constexpr TaskControlBlock* front() const noexcept { return head; }
+         [[nodiscard]] constexpr bool has_peer() const noexcept { return head && head != tail; }
+
+         void push_back(TaskControlBlock* tcb) noexcept
+         {
+            assert(tcb->next == nullptr && tcb->prev == nullptr && "TCB already linked");
+            tcb->next = nullptr;
+            tcb->prev = tail;
+            if (tail) tail->next = tcb; else head = tcb;
+            tail = tcb;
+         }
+         TaskControlBlock* pop_front() noexcept
+         {
+            if (!head) return nullptr;
+            auto* tcb = head;
+            head = tcb->next;
+            if (head) head->prev = nullptr; else tail = nullptr;
+            tcb->next = tcb->prev = nullptr;
+            return tcb;
+         }
+         void remove(TaskControlBlock* tcb) noexcept
+         {
+            if (tcb->prev) tcb->prev->next = tcb->next; else head = tcb->next;
+            if (tcb->next) tcb->next->prev = tcb->prev; else tail = tcb->prev;
+            tcb->next = tcb->prev = nullptr;
+         }
+         // This walks the linked list so isn't 'free'. Will be used for debugging only for now
+         [[nodiscard]] size_t size() const noexcept
+         {
+            std::size_t n = 0;
+            for (auto* tcb = head; tcb; tcb = tcb->next) ++n;
+            return n;
+         }
+      };
+
+      std::array<RoundRobinQueue, MAX_PRIORITIES> matrix{};
+      uint32_t bitmap{0};
+      static_assert(MAX_PRIORITIES <= UINT32_BITS, "bitmap cannot hold that many priorities!");
+
+   public:
+      [[nodiscard]] constexpr bool empty() const noexcept { return bitmap == 0; }
+      [[nodiscard]] constexpr bool empty_at(uint32_t priority) const noexcept
+      {
+         return matrix[priority].empty();
+      }
+      [[nodiscard]] std::size_t size_at(uint32_t priority) const noexcept
+      {
+         return matrix[priority].size();
+      }
+      [[nodiscard]] constexpr bool has_peer(uint32_t priority) const noexcept
+      {
+         return matrix[priority].has_peer();
+      }
+      [[nodiscard]] constexpr int best_priority() const noexcept
+      {
+         return bitmap ? std::countr_zero(bitmap) : -1;
+      }
+      [[nodiscard]] std::bitset<UINT32_BITS> bitmap_view() const noexcept
+      {
+         return std::bitset<UINT32_BITS>(bitmap);
+      }
+
+      void enqueue_task(TaskControlBlock* tcb) noexcept
+      {
+         matrix[tcb->priority].push_back(tcb);
+         bitmap |= (1u << tcb->priority);
+      }
+      TaskControlBlock* pop_highest_task() noexcept
+      {
+         if (bitmap == 0) return nullptr;
+         auto const priority = std::countr_zero(bitmap);
+         TaskControlBlock* tcb = matrix[priority].pop_front();
+         if (matrix[priority].empty()) bitmap &= ~(1u << priority);
+         return tcb;
+      }
+      TaskControlBlock* peek_highest_task() const noexcept
+      {
+         if (bitmap == 0) return nullptr;
+         auto const priority = std::countr_zero(bitmap);
+         return matrix[priority].front();
+      }
+      void remove_task(TaskControlBlock* tcb) noexcept
+      {
+         auto const priority = tcb->priority;
+         matrix[priority].remove(tcb);
+         if (matrix[priority].empty()) bitmap &= ~(1u << priority);
+      }
+   };
+
+   class AtomicDeadline
    {
       std::atomic_uint32_t deadline{UINT32_MAX};
 
-      constexpr void store(Tick tick, std::memory_order mo = std::memory_order_relaxed) noexcept
+   public:
+      void store(Tick tick, std::memory_order mo = std::memory_order_relaxed) noexcept
       {
          deadline.store(tick.value(), mo);
       }
-      constexpr Tick load(std::memory_order mo = std::memory_order_relaxed) noexcept
+      [[nodiscard]] Tick load(std::memory_order mo = std::memory_order_relaxed) noexcept
       {
          return Tick(deadline.load(mo));
       }
-      constexpr void disarm() noexcept { deadline.store(UINT32_MAX, std::memory_order_relaxed); }
+      void disarm() noexcept { deadline.store(UINT32_MAX, std::memory_order_relaxed); }
    };
 
    struct InternalSchedulerState
@@ -62,8 +168,7 @@ namespace rtk
       TaskControlBlock* current_task{nullptr};
       Thread* idle_thread{nullptr};
 
-      std::array<std::deque<TaskControlBlock*>, MAX_PRIORITIES> ready{}; // TODO: replace deque with something that does not use heap
-      std::bitset<MAX_PRIORITIES> ready_bitmap;
+      ReadyMatrix ready_matrix;
       std::deque<TaskControlBlock*> sleep_queue{}; // TODO: replace with wheel/heap later
       AtomicDeadline next_wake_tick; // When next sleeper must be woken
       AtomicDeadline next_slice_tick; // When the next RR rotation is due
@@ -80,26 +185,11 @@ namespace rtk
    };
    static /*constinit*/ InternalSchedulerState iss;
 
-   static TaskControlBlock* pick_highest_ready()
-   {
-      if (iss.ready_bitmap.none()) return nullptr;
-      uint8_t priority = std::countr_zero(iss.ready_bitmap.to_ulong());
-      return iss.ready[priority].front();
-   }
-
-   static void remove_ready_head(uint8_t priority)
-   {
-      auto& queue = iss.ready[priority];
-      assert(!queue.empty() && "There is no ready head to remove!");
-      queue.pop_front();
-      if (queue.empty()) iss.ready_bitmap.reset(priority);
-   }
-
-   static void set_ready(TaskControlBlock* tcb)
+   static void set_task_ready(TaskControlBlock* tcb)
    {
       tcb->state = TaskControlBlock::State::Ready;
-      iss.ready[tcb->priority].push_back(tcb);
-      iss.ready_bitmap.set(tcb->priority);
+      iss.ready_matrix.enqueue_task(tcb);
+      // If the new task is higher priority than the running one, we need to reschedule.
       if (!iss.current_task || tcb->priority < iss.current_task->priority) {
          iss.need_reschedule.store(true, std::memory_order_relaxed);
       }
@@ -117,7 +207,7 @@ namespace rtk
 
    static void schedule()
    {
-      if (iss.preempt_disabled.load()) return;
+      if (iss.preempt_disabled.load(std::memory_order_acquire)) return;
       if (!iss.need_reschedule.exchange(false)) return;
       DEBUG_DUMP_READY_QUEUE("schedule() need_reschedule -> true");
 
@@ -129,7 +219,7 @@ namespace rtk
          TaskControlBlock* tcb = *it;
          if (now.has_reached(tcb->wake_tick)) {
             it = iss.sleep_queue.erase(it);
-            set_ready(tcb);
+            set_task_ready(tcb);
          } else {
             next_due = std::min(next_due, tcb->wake_tick);
             ++it;
@@ -141,13 +231,13 @@ namespace rtk
       if (now.has_reached(iss.next_slice_tick.load()) &&
           iss.current_task &&
           iss.current_task->state == TaskControlBlock::State::Running &&
-         !iss.ready[iss.current_task->priority].empty()) // Don't requeue for singular threads at a priority level
+          iss.ready_matrix.has_peer(iss.current_task->priority)) // Don't requeue for singular threads at a priority level
       {
-         set_ready(iss.current_task);
+         set_task_ready(iss.current_task);
       }
 
       // Choose next runnable
-      auto* next_task = pick_highest_ready();
+      auto* next_task = iss.ready_matrix.pop_highest_task();
       if (!next_task) {
          iss.next_slice_tick.disarm();
          return; // Shhhh everyone is sleeping!
@@ -157,10 +247,9 @@ namespace rtk
       if (iss.current_task && iss.current_task != next_task &&
           iss.current_task->state == TaskControlBlock::State::Running)
       {
-         set_ready(iss.current_task);
+         set_task_ready(iss.current_task);
       }
 
-      remove_ready_head(next_task->priority);
       if (next_task->priority == IDLE_PRIORITY) {
          iss.next_slice_tick.disarm();
       } else {
@@ -184,9 +273,8 @@ namespace rtk
    void Scheduler::start()
    {
       DEBUG_DUMP_READY_QUEUE("start() entry");
-      auto first = pick_highest_ready();
+      auto first = iss.ready_matrix.pop_highest_task();
       assert(first != nullptr);
-      remove_ready_head(first->priority);
       DEBUG_DUMP_READY_QUEUE("start() head picked/removed");
       iss.current_task = first;
       iss.current_task->state = TaskControlBlock::State::Running;
@@ -207,7 +295,7 @@ namespace rtk
    void Scheduler::yield()
    {
       if (iss.current_task && iss.current_task->state == TaskControlBlock::State::Running) {
-         set_ready(iss.current_task); // put current at tail
+         set_task_ready(iss.current_task); // put current at tail
       }
       rtk_request_reschedule();
       port_yield();
@@ -236,7 +324,7 @@ namespace rtk
       port_yield();
    }
 
-   void Scheduler::preempt_disable() { port_preempt_disable(); iss.preempt_disabled.store(true, std::memory_order_acquire); }
+   void Scheduler::preempt_disable() { port_preempt_disable(); iss.preempt_disabled.store(true, std::memory_order_release); }
    void Scheduler::preempt_enable()  { iss.preempt_disabled.store(false, std::memory_order_release); port_preempt_enable(); }
 
    static port_context_t* alloc_port_context()
@@ -274,7 +362,7 @@ namespace rtk
 
       port_context_init(tcb->context, stack_base, stack_size, thread_trampoline, tcb);
 
-      set_ready(tcb);
+      set_task_ready(tcb);
       DEBUG_DUMP_READY_QUEUE("Thread() created");
    }
 
@@ -307,9 +395,11 @@ namespace rtk
    static void DEBUG_DUMP_READY_QUEUE(const char* where)
    {
    #if defined(RTK_SIMULATION)
-      std::printf("[%d %s] bitmap: %s", port_tick_now(), where, iss.ready_bitmap.to_string().c_str());
+      std::printf("[%u %s] bitmap: %s", port_tick_now(), where, iss.ready_matrix.bitmap_view().to_string().c_str());
       for (unsigned p = 0; p < MAX_PRIORITIES; ++p) {
-         if (!iss.ready[p].empty()) std::printf(" p%u(%zu)", p, iss.ready[p].size());
+         if (!iss.ready_matrix.empty_at(p)) {
+            std::printf(" p%u(%zu)", p, iss.ready_matrix.size_at(p));
+         }
       }
       std::printf(" current_task=%p\n", (void*)iss.current_task);
    #endif

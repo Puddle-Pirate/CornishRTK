@@ -18,7 +18,7 @@ namespace rtk
    static constexpr uint32_t MAX_PRIORITIES = 32; // 0 = highest, 31 = lowest
    static constexpr uint32_t TIME_SLICE     = 10; // In ticks
 
-   static_assert(MAX_PRIORITIES <= sizeof(unsigned long)*8, "Unsupported configuration");
+   static_assert(MAX_PRIORITIES <= UINT32_WIDTH, "Unsupported configuration");
 
    struct Scheduler
    {
