@@ -16,7 +16,7 @@ void     port_init(uint32_t tick_hz);   /* set up periodic tick (0 => default) *
 uint32_t port_tick_now(void);           /* monotonic tick */
 
 /* Context lifecycle */
-void port_context_init(port_context_t* ctx,
+void port_context_init(port_context_t* context,
                        void* stack_base, size_t stack_size,
                        port_entry_t entry, void* arg);
 void port_context_destroy(port_context_t* ctx);

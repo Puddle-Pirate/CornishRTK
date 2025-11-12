@@ -44,6 +44,8 @@ static thread_local port_context* tls_current = nullptr;
 void port_context_init(port_context_t* context, void* stack_base, size_t stack_size, port_entry_t entry, void* arg)
 {
    ::new (context) port_context{
+      .cont = {},
+      .sched = {},
       .stack_top  = static_cast<uint8_t*>(stack_base) + stack_size,
       .stack_size = stack_size,
       .entry      = entry,
@@ -51,10 +53,19 @@ void port_context_init(port_context_t* context, void* stack_base, size_t stack_s
       .started    = false,
    };
 
-   // Allocate a stack internally via Boost allocator (ignores stack_base for now).
-   // This is fine for Linux simulation; we'll switch to preallocated later.
-   boost::context::protected_fixedsize_stack salloc{context->stack_size};
-   context->cont = boost::context::callcc([context](boost::context::continuation&& sched_in) mutable -> boost::context::continuation
+
+   // Build a Boost stack_context pointing to the caller-provided memory.
+   // Boost expects .sp to be the *top* of the stack for downward-growing stacks.
+   boost::context::stack_context stack_context = {
+      .size = context->stack_size,
+      .sp   = context->stack_top,
+   };
+
+   // Preallocated descriptor and allocator
+   auto prealloc = boost::context::preallocated(context->stack_top, context->stack_size, stack_context);
+   auto salloc = boost::context::protected_fixedsize_stack(context->stack_size);
+   context->cont = boost::context::callcc(std::allocator_arg, prealloc, salloc,
+      [context](boost::context::continuation&& sched_in) mutable -> boost::context::continuation
       {
          // First entry: park immediately by giving control back to scheduler.
          context->sched = std::move(sched_in);
@@ -64,7 +75,7 @@ void port_context_init(port_context_t* context, void* stack_base, size_t stack_s
          while (true)
          {
             tls_current = context;                 // we're the running thread
-            context->entry(context->arg);              // if it returns, thread is "done"
+            context->entry(context->arg);          // if it returns, thread is "done"
             // Hand control back to scheduler so it can clean up/decide next.
             tls_current = nullptr;
             context->sched = context->sched.resume();  // yield back to scheduler
@@ -83,7 +94,7 @@ static thread_local void* thread_pointer = nullptr;
 void port_set_thread_pointer(void* tp) { thread_pointer = tp; }
 void* port_get_thread_pointer(void)    { return thread_pointer; }
 
-void port_switch(port_context_t* /*from (unused)*/, port_context_t* to)
+void port_switch(port_context_t* /*from*/, port_context_t* to)
 {
    tls_current = to;
    // Resume target. When the thread yields, control returns here.
@@ -122,7 +133,7 @@ void port_idle()
    port_yield(); // Under linux sim, we must explicitly resume the scheduler.
 }
 
-// Tick source: SIGALRM -> bump tick & call kernel hook. No switching here.
+// Tick source: SIGALRM -> bump tick & call kernel hook.
 static void tick_handler(int)
 {
    g_tick.fetch_add(1, std::memory_order_relaxed);
