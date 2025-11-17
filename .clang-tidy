@@ -45,6 +45,7 @@ Checks:
   - -performance-no-int-to-ptr
   - -readability-avoid-return-with-void-value
   - -readability-braces-around-statements
+  - -readability-identifier-length
   - -readability-implicit-bool-conversion
   - -readability-isolate-declaration
   - -readability-named-parameter
@@ -53,12 +54,8 @@ Checks:
 WarningsAsErrors: ''
 HeaderFilterRegex: '.*'
 FormatStyle:     none
-CheckOptions:
-  - key:            readability-identifier-length.IgnoredLoopCounterNames
-    value:          '^[ijkln]$'
-  - key:            readability-identifier-length.IgnoredParameterNames
-    value:          '^(a|b|i|j|k|l|n|ms|mo|fn)$'
-  - key:            readability-identifier-length.IgnoredVariableNames
-    value:          '^(a|b|i|j|k|l|n|ms|mo|fn)$'
+#CheckOptions:
+#  - key:            #
+#    value:          #
 
 ...
