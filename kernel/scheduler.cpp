@@ -59,6 +59,34 @@ namespace rtk
    };
    static_assert(std::is_trivially_copyable_v<TaskControlBlock>, "TaskControlBlock must be trivially copyable for reset-in-place to work!");;
 
+   struct StackLayout
+   {
+      TaskControlBlock* tcb;
+      void* tls_base;
+      std::size_t tls_size;
+      void* stack_base;
+      std::size_t stack_size;
+
+      StackLayout(void* buffer_base, std::size_t buffer_size)
+      {
+         auto base = reinterpret_cast<std::uintptr_t>(buffer_base);
+         auto end  = base + buffer_size;
+
+         auto tcb_start = align_down(end - sizeof(TaskControlBlock), alignof(TaskControlBlock));
+         tcb = reinterpret_cast<TaskControlBlock*>(tcb_start);
+
+         std::uintptr_t tls_top = tcb_start;
+         tls_size = 0;  // TODO: wire real TLS size later
+         tls_base = reinterpret_cast<void*>(tls_top);
+
+         auto stack_top = reinterpret_cast<std::uintptr_t>(tls_base);
+         stack_base = reinterpret_cast<void*>(base);
+         stack_size = stack_top - base;
+
+         assert(stack_size > 64 && "Buffer too small after carving TCB/TLS"); // TODO: size the warning
+      }
+   };
+
    class ReadyMatrix
    {
       class RoundRobinQueue
@@ -273,10 +301,10 @@ namespace rtk
 
    struct InternalSchedulerState
    {
-      std::atomic<bool> preempt_disabled{false};
+      std::atomic<bool> preempt_disabled{true};
       std::atomic<bool> need_reschedule{false};
       TaskControlBlock* current_task{nullptr};
-      Thread* idle_thread{nullptr};
+      TaskControlBlock* idle_tcb{nullptr};
 
       ReadyMatrix ready_matrix;
       SleepMinHeap sleepers;
@@ -287,10 +315,10 @@ namespace rtk
 
       void reset() // Should I just do a self assignment from default ctor instead?
       {
-         preempt_disabled.store(false);
+         preempt_disabled.store(true);
          need_reschedule.store(false);
          current_task = nullptr;
-         idle_thread = nullptr;
+         idle_tcb = nullptr;
          next_wake_tick.disarm();
          next_slice_tick.disarm();
       }
@@ -351,6 +379,7 @@ namespace rtk
       // Round robin rotation
       if (iss.next_slice_tick.due(now) &&
           iss.current_task &&
+          iss.current_task != iss.idle_tcb &&
           iss.current_task->state == TaskControlBlock::State::Running &&
           iss.ready_matrix.has_peer(iss.current_task->priority)) // Don't requeue for singular threads at a priority level
       {
@@ -362,12 +391,17 @@ namespace rtk
       auto* next_task = iss.ready_matrix.pop_highest_task();
       if (!next_task) {
          iss.next_slice_tick.disarm();
-         DEBUG_PRINT("idle");
-         return; // Shhhh everyone is sleeping!
+         if (iss.current_task != iss.idle_tcb) {
+            DEBUG_PRINT("pick idle");
+            context_switch_to(iss.idle_tcb);
+         }
+         return;
       }
 
       // If we are preempted by a higher thread, push current back to queue
-      if (iss.current_task && iss.current_task != next_task &&
+      if (iss.current_task &&
+          iss.current_task != iss.idle_tcb && // Idle does not belong in the ready matrix
+          iss.current_task != next_task &&
           iss.current_task->state == TaskControlBlock::State::Running)
       {
          set_task_ready(iss.current_task);
@@ -383,6 +417,14 @@ namespace rtk
       context_switch_to(next_task);
    }
 
+   static void thread_trampoline(void* arg_void)
+   {
+      auto* tcb = static_cast<TaskControlBlock*>(arg_void);
+      tcb->entry_fn(tcb->arg);
+      // If user function returns, park/surrender forever (could signal joiners later)
+      while (true) Scheduler::yield();
+   }
+
    alignas(RTK_STACK_ALIGN) static std::array<uint8_t, 1024> idle_stack{}; // TODO: size stack
    static void idle_entry(void*) { while(true) port_idle(); }
 
@@ -391,7 +433,27 @@ namespace rtk
       iss.reset();
       port_init(tick_hz);
       // Create the idle thread
-      iss.idle_thread = new Thread(idle_entry, nullptr, idle_stack.data(), idle_stack.size(), IDLE_PRIORITY);
+      StackLayout idle_layout(idle_stack.data(), idle_stack.size());
+      iss.idle_tcb = ::new (idle_layout.tcb) TaskControlBlock{
+         .state      = TaskControlBlock::State::Ready,
+         .priority   = IDLE_PRIORITY,
+         .wake_tick  = Tick{0},
+         .stack_base = idle_layout.stack_base,
+         .stack_size = idle_layout.stack_size,
+         .entry_fn   = idle_entry,
+         .arg        = nullptr,
+         .next       = nullptr,
+         .prev       = nullptr,
+         .sleep_index= UINT16_MAX,
+      };
+
+      port_context_init(iss.idle_tcb->context(),
+                        idle_layout.stack_base,
+                        idle_layout.stack_size,
+                        thread_trampoline,
+                        iss.idle_tcb);
+      // Note: we intentionally do NOT call set_task_ready(idle_tcb).
+      // Idle is never in ready_matrix.
    }
 
    void Scheduler::start()
@@ -403,6 +465,7 @@ namespace rtk
       iss.current_task = first;
       iss.current_task->state = TaskControlBlock::State::Running;
       iss.next_slice_tick.store(Scheduler::tick_now() + TIME_SLICE);
+      iss.preempt_disabled.store(false, std::memory_order_release); // Open the scheduler
 
       port_set_thread_pointer(iss.current_task); // I think this is correct?
       port_start_first(iss.current_task->context());
@@ -454,42 +517,6 @@ namespace rtk
    void Scheduler::preempt_disable() { port_preempt_disable(); iss.preempt_disabled.store(true, std::memory_order_release); }
    void Scheduler::preempt_enable()  { iss.preempt_disabled.store(false, std::memory_order_release); port_preempt_enable(); }
 
-   static void thread_trampoline(void* arg_void)
-   {
-      auto* tcb = static_cast<TaskControlBlock*>(arg_void);
-      tcb->entry_fn(tcb->arg);
-      // If user function returns, park/surrender forever (could signal joiners later)
-      while (true) Scheduler::yield();
-   }
-
-   struct StackLayout
-   {
-      TaskControlBlock* tcb;
-      void* tls_base;
-      std::size_t tls_size;
-      void* stack_base;
-      std::size_t stack_size;
-
-      StackLayout(void* buffer_base, std::size_t buffer_size)
-      {
-         auto base = reinterpret_cast<std::uintptr_t>(buffer_base);
-         auto end  = base + buffer_size;
-
-         auto tcb_start = align_down(end - sizeof(TaskControlBlock), alignof(TaskControlBlock));
-         tcb = reinterpret_cast<TaskControlBlock*>(tcb_start);
-
-         std::uintptr_t tls_top = tcb_start;
-         tls_size = 0;  // TODO: wire real TLS size later
-         tls_base = reinterpret_cast<void*>(tls_top);
-
-         auto stack_top = reinterpret_cast<std::uintptr_t>(tls_base);
-         stack_base = reinterpret_cast<void*>(base);
-         stack_size = stack_top - base;
-
-         assert(stack_size > 64 && "Buffer too small after carving TCB/TLS"); // TODO: size the warning
-      }
-   };
-
    Thread::Thread(EntryFunction fn, void* arg, void* stack_base, std::size_t stack_size, uint8_t priority)
    {
       assert(priority < MAX_PRIORITIES);
@@ -497,8 +524,8 @@ namespace rtk
       StackLayout stack_layout(stack_base, stack_size);
       tcb = ::new (stack_layout.tcb) TaskControlBlock{
          .priority = priority,
-         .stack_base = stack_base,
-         .stack_size = stack_size,
+         .stack_base = stack_layout.stack_base,
+         .stack_size = stack_layout.stack_size,
          .entry_fn = fn,
          .arg = arg,
       };
