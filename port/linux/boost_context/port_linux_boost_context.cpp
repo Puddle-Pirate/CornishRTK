@@ -8,6 +8,7 @@
 #include <boost/context/preallocated.hpp>
 #include <boost/context/stack_context.hpp>
 
+#include <array>
 #include <atomic>
 #include <csignal>
 #include <cstdint>
@@ -27,13 +28,12 @@ void port_irq_enable() {}
 
 struct port_context
 {
-  boost::context::fiber thread; // thread fiber (owned by scheduler when idle)
-  boost::context::fiber sched;  // scheduler fiber (owned by thread when running)
-  void*        stack_top;
-  std::size_t  stack_size;
-  port_entry_t entry;
-  void*        arg;
-  bool         started;
+   boost::context::fiber thread; // thread fiber (owned by scheduler when idle)
+   boost::context::fiber sched;  // scheduler fiber (owned by thread when running)
+   void*        stack_top;
+   std::size_t  stack_size;
+   port_entry_t entry;
+   void*        arg;
 };
 
 static_assert(RTK_PORT_CONTEXT_SIZE  == sizeof(port_context_t), "Adjust port_traits.h definition to match");
@@ -51,6 +51,8 @@ struct preallocated_stack_noop
   void deallocate(boost::context::stack_context&) noexcept {}
 };
 
+// Initialize an opaque port_context_t using caller-owned stack memory
+// 'stack_base'/'stack_size' must obey RTK_STACK_ALIGN constraints
 void port_context_init(port_context_t* context,
                        void* stack_base,
                        std::size_t stack_size,
@@ -65,7 +67,6 @@ void port_context_init(port_context_t* context,
       .stack_size= stack_size,
       .entry     = entry,
       .arg       = arg,
-      .started   = false,
    };
 
    // Build a fiber bound to the user-provided stack.
@@ -92,8 +93,6 @@ void port_context_init(port_context_t* context,
             // When resumed, we loop and re-enter user code
          }
       });
-
-   context->started = true; // Constructed and ready (not actually running yet!)
 }
 
 void port_context_destroy(port_context_t* context)
@@ -138,10 +137,10 @@ void port_yield()
       return;
    }
 
-   port_context* current = nullptr;
-   std::swap(current, tls_current);
-   // Yield to the stored scheduler fiber; the returned fiber
-   // is the thread's handle updated for the next resume.
+   auto* current = tls_current;
+   tls_current = nullptr;
+   // Yield to the stored scheduler fiber. The returned fiber
+   // is the updated scheduler handle for this thread
    current->sched = std::move(current->sched).resume();
 }
 
