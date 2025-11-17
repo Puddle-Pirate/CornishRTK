@@ -20,7 +20,7 @@ int main()
 {
    rtk::Scheduler::init(10); // Tune for testing
 
-   // Equal priority → round-robin; lower number means higher priority in our model
+   // Equal priority -> round-robin
    rtk::Thread t1(worker, (void*)"T1 tick", t1_stack.data(), t1_stack.size(), /*prio*/ 2);
    rtk::Thread t2(worker, (void*)"T2 tock", t2_stack.data(), t2_stack.size(), /*prio*/ 2);
 
