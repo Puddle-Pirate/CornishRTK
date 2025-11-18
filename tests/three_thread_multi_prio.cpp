@@ -4,9 +4,9 @@
 #include <cstdint>
 #include <iostream>
 
-alignas(16) static std::array<std::uint8_t, 16 * 1024> fast_stack{};
-alignas(16) static std::array<std::uint8_t, 16 * 1024> slow_stack{};
-alignas(16) static std::array<std::uint8_t, 16 * 1024> logger_stack{};
+alignas(16) static std::array<std::byte, 16 * 1024> fast_stack{};
+alignas(16) static std::array<std::byte, 16 * 1024> slow_stack{};
+alignas(16) static std::array<std::byte, 16 * 1024> logger_stack{};
 
 static void fast_worker(void* arg)
 {
@@ -63,18 +63,12 @@ int main()
    //   logger: prio 10 (only runs when others are sleeping)
    rtk::Thread fast_thread(fast_worker,
                            (void*)"fast_worker",
-                           fast_stack.data(), fast_stack.size(),
-                           /*prio*/ 1);
+                           fast_stack,
+                           rtk::Thread::Priority(1));
 
-   rtk::Thread slow_thread(slow_worker,
-                           (void*)"slow_worker",
-                           slow_stack.data(), slow_stack.size(),
-                           /*prio*/ 2);
+   rtk::Thread slow_thread(slow_worker, (void*)"slow_worker", slow_stack, rtk::Thread::Priority(2));
 
-   rtk::Thread logger_thread(logger_worker,
-                             nullptr,
-                             logger_stack.data(), logger_stack.size(),
-                             /*prio*/ 10);
+   rtk::Thread logger_thread(logger_worker, nullptr, logger_stack, rtk::Thread::Priority(10));
 
    rtk::Scheduler::start();
    return 0;

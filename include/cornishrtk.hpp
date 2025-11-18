@@ -8,8 +8,10 @@
 #ifndef _CORNISH_RTK_HPP_
 #define _CORNISH_RTK_HPP_
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <span>
 #include <type_traits>
 
 namespace rtk
@@ -19,7 +21,7 @@ namespace rtk
    static constexpr uint32_t MAX_THREADS    = 64;
    static constexpr uint32_t TIME_SLICE     = 10; // In ticks
 
-   static_assert(MAX_PRIORITIES <= UINT32_WIDTH, "Unsupported configuration");
+   static_assert(MAX_PRIORITIES <= std::numeric_limits<uint32_t>::digits, "Unsupported configuration");
 
    struct Scheduler
    {
@@ -46,7 +48,10 @@ namespace rtk
    public:
       using Id = std::uint32_t;
       using EntryFunction = void(*)(void*);
-      Thread(EntryFunction fn, void* arg, void* stack_base, std::size_t stack_size, uint8_t priority);
+
+      struct Priority { std::uint8_t val; constexpr explicit Priority(std::uint8_t v) : val(v) {} };
+
+      Thread(EntryFunction fn, void* arg, std::span<std::byte> stack, Priority priority);
       ~Thread();
 
       [[nodiscard]] Id get_id() const noexcept;

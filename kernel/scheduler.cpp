@@ -11,11 +11,13 @@
 #include <bit>
 #include <bitset>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <limits>
+#include <span>
 
 // I hate macros but oh well
 #define DEBUG_PRINT_ENABLE 1
@@ -32,7 +34,7 @@ namespace rtk
    static void DEBUG_DUMP_READY_QUEUE(const char* where);
 
    static constexpr uint32_t UINT32_BITS = std::numeric_limits<uint32_t>::digits;
-   static constexpr uint32_t IDLE_PRIORITY = MAX_PRIORITIES - 1;
+   static constexpr uint8_t  IDLE_PRIORITY = MAX_PRIORITIES - 1;
 
    static constexpr std::size_t align_down(std::size_t size, std::size_t align) { return size & ~(align - 1); }
    static constexpr std::size_t align_up(std::size_t size, std::size_t align)   { return (size + (align - 1)) & ~(align - 1); }
@@ -44,8 +46,7 @@ namespace rtk
       uint8_t priority{0};
       Tick    wake_tick{0};
 
-      void*  stack_base{nullptr};
-      size_t stack_size{0};
+      std::span<std::byte> stack;
       Thread::EntryFunction entry_fn{nullptr};
       void*  arg{nullptr};
 
@@ -58,33 +59,38 @@ namespace rtk
       alignas(RTK_PORT_CONTEXT_ALIGN) std::array<std::byte, RTK_PORT_CONTEXT_SIZE> context_storage{};
       port_context_t* context() noexcept { return reinterpret_cast<port_context_t*>(context_storage.data()); }
    };
-   static_assert(std::is_trivially_copyable_v<TaskControlBlock>, "TaskControlBlock must be trivially copyable for reset-in-place to work!");;
 
    struct StackLayout
    {
       TaskControlBlock* tcb;
-      void* tls_base;
-      std::size_t tls_size;
-      void* stack_base;
-      std::size_t stack_size;
+      std::span<std::byte> tls_region;
+      std::span<std::byte> user_stack;
 
-      StackLayout(void* buffer_base, std::size_t buffer_size)
+      explicit StackLayout(std::span<std::byte> const buffer, std::size_t const tls_bytes)
       {
-         auto base = reinterpret_cast<std::uintptr_t>(buffer_base);
-         auto end  = base + buffer_size;
+         auto const base = reinterpret_cast<std::uintptr_t>(buffer.data());
+         auto const end  = base + buffer.size();
 
-         auto tcb_start = align_down(end - sizeof(TaskControlBlock), alignof(TaskControlBlock));
+         // TCB at very top, aligned down
+         auto const tcb_start = align_down(end - sizeof(TaskControlBlock), alignof(TaskControlBlock));
          tcb = reinterpret_cast<TaskControlBlock*>(tcb_start);
 
-         std::uintptr_t tls_top = tcb_start;
-         tls_size = 0;  // TODO: wire real TLS size later
-         tls_base = reinterpret_cast<void*>(tls_top);
+         // TLS just below TCB
+         auto const tls_size = align_up(tls_bytes, alignof(std::max_align_t));
+         auto const tls_top  = tcb_start;
+         auto const tls_base = align_down(tls_top - tls_size, alignof(std::max_align_t));
 
-         auto stack_top = reinterpret_cast<std::uintptr_t>(tls_base);
-         stack_base = reinterpret_cast<void*>(base);
-         stack_size = stack_top - base;
+         assert(tls_base >= base && "Buffer too small for TLS+TCB");
 
-         assert(stack_size > 64 && "Buffer too small after carving TCB/TLS"); // TODO: size the warning
+         auto const tls_offset = static_cast<std::size_t>(tls_base - base);
+         auto const tls_length = static_cast<std::size_t>(tls_top  - tls_base);
+         tls_region = buffer.subspan(tls_offset, tls_length); // zero-length span if tls_bytes == 0
+
+         // User stack: everything below TLS
+         auto const stack_len = static_cast<std::size_t>(tls_base - base);
+         assert(stack_len > 64 && "Buffer too small after carving TCB/TLS");
+
+         user_stack = buffer.subspan(0, stack_len);
       }
    };
 
@@ -334,7 +340,7 @@ namespace rtk
       if (previous_task) previous_task->state = TaskControlBlock::State::Ready; // Task might have already been set ready but ensure it is
       iss.current_task->state = TaskControlBlock::State::Running;
 
-      DEBUG_PRINT("context_switch_to(): previous=%u -> next=%u", previous_task->id, next->id);
+      DEBUG_PRINT("context_switch_to(): previous=%u -> next=%u", previous_task ? previous_task->id : 0u, next->id);
 
       port_set_thread_pointer(next);
       port_switch(previous_task ? previous_task->context() : nullptr, iss.current_task->context());
@@ -415,21 +421,20 @@ namespace rtk
       while (true) Scheduler::yield();
    }
 
-   alignas(RTK_STACK_ALIGN) static std::array<uint8_t, 2048> idle_stack{}; // TODO: size stack
+   alignas(RTK_STACK_ALIGN) static std::array<std::byte, 2048> idle_stack{}; // TODO: size stack
    static void idle_entry(void*) { while(true) port_idle(); }
 
    void Scheduler::init(uint32_t tick_hz)
    {
       port_init(tick_hz);
       // Create the idle thread
-      StackLayout idle_layout(idle_stack.data(), idle_stack.size());
-      iss.idle_tcb = ::new (idle_layout.tcb) TaskControlBlock{
+      StackLayout slayout(idle_stack, 0);
+      iss.idle_tcb = ::new (slayout.tcb) TaskControlBlock{
          .id         = 1, // Reserved for the idle thread
          .state      = TaskControlBlock::State::Ready,
          .priority   = IDLE_PRIORITY,
          .wake_tick  = Tick{0},
-         .stack_base = idle_layout.stack_base,
-         .stack_size = idle_layout.stack_size,
+         .stack      = slayout.user_stack,
          .entry_fn   = idle_entry,
          .arg        = nullptr,
          .next       = nullptr,
@@ -438,8 +443,8 @@ namespace rtk
       };
 
       port_context_init(iss.idle_tcb->context(),
-                        idle_layout.stack_base,
-                        idle_layout.stack_size,
+                        slayout.user_stack.data(),
+                        slayout.user_stack.size(),
                         thread_trampoline,
                         iss.idle_tcb);
       // Note: we intentionally do NOT call set_task_ready(idle_tcb).
@@ -507,23 +512,22 @@ namespace rtk
    void Scheduler::preempt_disable() { port_preempt_disable(); iss.preempt_disabled.store(true, std::memory_order_release); }
    void Scheduler::preempt_enable()  { iss.preempt_disabled.store(false, std::memory_order_release); port_preempt_enable(); }
 
-   Thread::Thread(EntryFunction fn, void* arg, void* stack_base, std::size_t stack_size, uint8_t priority)
+   Thread::Thread(EntryFunction fn, void* arg, std::span<std::byte> stack, Priority priority)
    {
-      assert(priority < IDLE_PRIORITY);
+      assert(priority.val < IDLE_PRIORITY);
 
       auto id = iss.next_thread_id.fetch_add(1, std::memory_order_relaxed);
 
-      StackLayout stack_layout(stack_base, stack_size);
-      tcb = ::new (stack_layout.tcb) TaskControlBlock{
+      StackLayout slayout(stack, 0);
+      tcb = ::new (slayout.tcb) TaskControlBlock{
          .id = id,
-         .priority = priority,
-         .stack_base = stack_layout.stack_base,
-         .stack_size = stack_layout.stack_size,
+         .priority = priority.val,
+         .stack = slayout.user_stack,
          .entry_fn = fn,
          .arg = arg,
       };
 
-      port_context_init(tcb->context(), stack_layout.stack_base, stack_layout.stack_size, thread_trampoline, tcb);
+      port_context_init(tcb->context(), slayout.user_stack.data(), slayout.user_stack.size(), thread_trampoline, tcb);
 
       set_task_ready(tcb);
       DEBUG_DUMP_READY_QUEUE("Thread() created");
