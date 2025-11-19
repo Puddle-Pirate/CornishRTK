@@ -544,6 +544,111 @@ namespace rtk
       return tcb_size + tls_size;
    }
 
+   bool Mutex::has_waiters() const noexcept { return wait_head != nullptr; }
+
+   void Mutex::enqueue_waiter(TaskControlBlock* tcb) noexcept
+   {
+      // TCB must not be in any other intrusive list
+      assert(tcb->next == nullptr && tcb->prev == nullptr);
+
+      tcb->next = nullptr;
+      tcb->prev = wait_tail;
+
+      if (wait_tail) {
+         wait_tail->next = tcb;
+      } else {
+         wait_head = tcb;
+      }
+      wait_tail = tcb;
+   }
+
+   TaskControlBlock* Mutex::pop_waiter() noexcept
+   {
+      TaskControlBlock* tcb = wait_head;
+      if (!tcb) return nullptr;
+
+      wait_head = tcb->next;
+      if (wait_head) {
+         wait_head->prev = nullptr;
+      } else {
+         wait_tail = nullptr;
+      }
+      tcb->next = nullptr;
+      tcb->prev = nullptr;
+      return tcb;
+   }
+
+   void Mutex::lock()
+   {
+      {
+         Scheduler::Lock guard;
+
+         auto* current = iss.current_task;
+         assert(current && "Mutex::lock() with no current task");
+
+         if (owner == nullptr) {
+            owner = current;
+            return;
+         }
+         assert(owner != current && "Mutex::lock() called recursively by owner");
+
+         DEBUG_PRINT("mutex lock: id=%u blocked on mutex %p", current->id, (void*)this);
+
+         current->state = TaskControlBlock::State::Blocked;
+         enqueue_waiter(current);
+
+         rtk_request_reschedule();
+      }
+
+      // Actually block
+      port_yield();
+   }
+
+   bool Mutex::try_lock()
+   {
+      Scheduler::Lock guard;
+
+      auto* current = iss.current_task;
+      assert(current && "Mutex::try_lock() with no current task");
+
+      if (owner == nullptr) {
+         owner = current;
+         return true;
+      }
+
+      if (owner == current) {
+         return false; // non-recursive
+      }
+
+      return false;
+   }
+
+   void Mutex::unlock()
+   {
+      Scheduler::Lock guard;
+
+      auto* current = iss.current_task;
+      assert(current && "Mutex::unlock() with no current task");
+      assert(owner == current && "Mutex::unlock() by non-owner");
+
+      if (!has_waiters()) {
+         owner = nullptr;
+         return;
+      }
+
+      TaskControlBlock* next_owner = pop_waiter();
+      assert(next_owner);
+
+      owner = next_owner;
+
+      DEBUG_PRINT("mutex unlock: id=%u -> waking waiter id=%u on mutex %p",
+                  current->id, next_owner->id, (void*)this);
+
+      next_owner->state = TaskControlBlock::State::Ready;
+      set_task_ready(next_owner);
+   }
+
+
    extern "C" void rtk_on_tick(void)
    {
       DEBUG_PRINT("rtk_on_tick()");

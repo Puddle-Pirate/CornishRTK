@@ -73,7 +73,27 @@ namespace rtk
    };
 
 
-   class Mutex;
+   class Mutex
+   {
+      struct TaskControlBlock* owner;
+      struct TaskControlBlock* wait_head;
+      struct TaskControlBlock* wait_tail;
+      [[nodiscard]] bool has_waiters() const noexcept;
+      void enqueue_waiter(TaskControlBlock* tcb) noexcept;
+      TaskControlBlock* pop_waiter() noexcept;
+
+   public:
+      Mutex()  = default;
+      ~Mutex() = default;
+      Mutex(Mutex&&)            = default;
+      Mutex& operator=(Mutex&&) = default;
+      Mutex(Mutex const&)            = delete;
+      Mutex& operator=(Mutex const&) = delete;
+
+      void lock();
+      bool try_lock();
+      void unlock();
+   };
 
    class Semaphore;
 
