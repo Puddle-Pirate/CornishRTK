@@ -23,83 +23,6 @@ namespace rtk
 
    static_assert(MAX_PRIORITIES <= std::numeric_limits<uint32_t>::digits, "Unsupported configuration");
 
-   struct Scheduler
-   {
-      static void init(uint32_t tick_hz);
-      static void start();
-      static void yield();
-      static class Tick tick_now();
-      static void sleep_for(uint32_t ticks);  // cooperative sleep (sim)
-
-      static void preempt_disable();
-      static void preempt_enable();
-
-      struct Lock
-      {
-         Lock()  { preempt_disable(); }
-         ~Lock() { preempt_enable(); }
-      };
-   };
-
-   class Thread
-   {
-      struct TaskControlBlock* tcb;
-
-   public:
-      using Id = std::uint32_t;
-
-      struct Entry
-      {
-         using Fn = void(*)(void*);
-         Fn fn;
-         void* arg;
-         explicit Entry(Fn fn, void* arg = nullptr) : fn(fn), arg(arg) {}
-         void operator()() const { fn(arg); }
-      };
-
-      struct Priority
-      {
-         std::uint8_t val;
-         constexpr explicit Priority(std::uint8_t v) : val(v) {}
-         operator uint8_t() const { return val; } // Intentionally implicit
-      };
-
-      Thread(Entry entry, std::span<std::byte> stack, Priority priority);
-      ~Thread();
-
-      [[nodiscard]] Id get_id() const noexcept;
-
-      static std::size_t reserved_stack_size();
-   };
-
-
-   class Mutex
-   {
-      struct TaskControlBlock* owner;
-      struct TaskControlBlock* wait_head;
-      struct TaskControlBlock* wait_tail;
-      [[nodiscard]] bool has_waiters() const noexcept;
-      void enqueue_waiter(TaskControlBlock* tcb) noexcept;
-      TaskControlBlock* pop_waiter() noexcept;
-
-   public:
-      Mutex()  = default;
-      ~Mutex() = default;
-      Mutex(Mutex&&)            = default;
-      Mutex& operator=(Mutex&&) = default;
-      Mutex(Mutex const&)            = delete;
-      Mutex& operator=(Mutex const&) = delete;
-
-      void lock();
-      bool try_lock();
-      void unlock();
-   };
-
-   class Semaphore;
-
-   class ConditionVar;
-
-
    class Tick
    {
       uint32_t t{0};
@@ -178,6 +101,95 @@ namespace rtk
    };
    static_assert(sizeof(Tick) == sizeof(uint32_t), "It is important that Tick be as cheap as uint32_t");
    static_assert(std::is_trivially_copyable_v<Tick>);
+
+   struct Scheduler
+   {
+      static void init(uint32_t tick_hz);
+      static void start();
+      static void yield();
+      static class Tick tick_now();
+      static void sleep_for(uint32_t ticks);  // cooperative sleep (sim)
+
+      static void preempt_disable();
+      static void preempt_enable();
+
+      struct Lock
+      {
+         Lock()  { preempt_disable(); }
+         ~Lock() { preempt_enable(); }
+      };
+   };
+
+   class Thread
+   {
+      struct TaskControlBlock* tcb;
+
+   public:
+      using Id = std::uint32_t;
+
+      struct Entry
+      {
+         using Fn = void(*)(void*);
+         Fn fn;
+         void* arg;
+         explicit Entry(Fn fn, void* arg = nullptr) : fn(fn), arg(arg) {}
+         void operator()() const { fn(arg); }
+      };
+
+      struct Priority
+      {
+         std::uint8_t val;
+         constexpr explicit Priority(std::uint8_t v) : val(v) {}
+         operator uint8_t() const { return val; } // Intentionally implicit
+      };
+
+      Thread(Entry entry, std::span<std::byte> stack, Priority priority);
+      ~Thread();
+
+      [[nodiscard]] Id get_id() const noexcept;
+
+      static std::size_t reserved_stack_size();
+   };
+
+   // Helper template that can hide private-implementation details
+   // of the public API declarations. To avoid UB, T must be trivially constructable,
+   // and of standard layout. This is statically asserted within the implementation TU.
+   // Essentially a compile-time, constexpr/constinit - conserving, pImpl structure.
+   template <typename T, std::size_t size, std::size_t align>
+   struct alignas(align) OpaqueImpl
+   {
+      std::byte opaque[size]{};
+      constexpr OpaqueImpl() = default;
+      constexpr T& operator* () { return *reinterpret_cast<T*>(opaque); }
+      constexpr T* operator->() { return  reinterpret_cast<T*>(opaque); }
+      constexpr T const& operator* () const { return *reinterpret_cast<T const*>(opaque); }
+      constexpr T const* operator->() const { return  reinterpret_cast<T const*>(opaque); }
+   };
+
+   class Mutex
+   {
+      OpaqueImpl<struct MutexImpl, 24, 8> self;
+
+   public:
+      constexpr Mutex() = default;
+      ~Mutex() = default;
+      constexpr Mutex(Mutex&&)            = default;
+      constexpr Mutex& operator=(Mutex&&) = default;
+      Mutex(Mutex const&)            = delete;
+      Mutex& operator=(Mutex const&) = delete;
+
+      [[nodiscard]] bool is_locked() const noexcept;
+      void lock();
+      bool try_lock();
+      bool try_lock_for(Tick::Delta timeout);
+      bool try_lock_until(Tick deadline);
+      void unlock();
+   };
+
+   class Semaphore;
+
+   class ConditionVar;
+
 
 } // namespace rtk
 
